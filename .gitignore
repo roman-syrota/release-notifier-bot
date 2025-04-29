@@ -1,0 +1,30 @@
+# Binaries for programs and plugins
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Build directories
+bin/
+
+# SQLite database
+bot.db
+
+# Vendor directory
+vendor/
+
+# Go cache and test results
+*.test
+coverage.out
+
+# Editor and OS files
+*.swp
+*~
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log 
