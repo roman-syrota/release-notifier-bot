@@ -10,6 +10,7 @@ bin/
 
 # SQLite database
 bot.db
+bot.db-*
 
 # Vendor directory
 vendor/

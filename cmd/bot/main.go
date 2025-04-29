@@ -33,10 +33,14 @@ func NewBot(token string, dbPath string, checkInterval time.Duration) (*Bot, err
 		return nil, err
 	}
 
-	db, err := sql.Open("sqlite3", dbPath)
+	dsn := fmt.Sprintf("%s?_journal_mode=WAL&_busy_timeout=5000", dbPath)
+	db, err := sql.Open("sqlite3", dsn)
 	if err != nil {
 		return nil, err
 	}
+
+	// Restrict to one connection to avoid SQLite locks
+	db.SetMaxOpenConns(1)
 
 	_, err = db.Exec(`
 		CREATE TABLE IF NOT EXISTS repositories (
