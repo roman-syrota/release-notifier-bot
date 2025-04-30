@@ -4,10 +4,13 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"os"
+	"os/signal"
 	"strings"
+	"syscall"
 	"time"
 
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
@@ -27,6 +30,7 @@ type Bot struct {
 	bot           *tgbotapi.BotAPI
 	db            *sql.DB
 	checkInterval time.Duration
+	done          chan struct{}
 }
 
 func NewBot(token string, dbPath string, checkInterval time.Duration) (*Bot, error) {
@@ -61,28 +65,99 @@ func NewBot(token string, dbPath string, checkInterval time.Duration) (*Bot, err
 		bot:           bot,
 		db:            db,
 		checkInterval: checkInterval,
+		done:          make(chan struct{}),
 	}, nil
 }
 
 func (b *Bot) Start() {
-	go b.checkReleases()
+	log.Println("Starting bot...")
 
+	// Setup goroutines with appropriate error handling
+	go b.checkReleases()
+	go b.keepAlive()
+
+	// Configure exponential backoff for reconnection attempts
+	backoffTime := 10 * time.Second
+	maxBackoff := 5 * time.Minute
+
+	for {
+		select {
+		case <-b.done:
+			log.Println("Stopping bot due to shutdown signal")
+			return
+		default:
+		}
+
+		log.Println("Starting bot update loop...")
+		if err := b.processUpdates(); err != nil {
+			log.Printf("Error in update loop: %v. Reconnecting in %v...", err, backoffTime)
+
+			// Sleep with cancellation support
+			select {
+			case <-time.After(backoffTime):
+				// Increase backoff time for next attempt, capped at maxBackoff
+				backoffTime = time.Duration(float64(backoffTime) * 1.5)
+				if backoffTime > maxBackoff {
+					backoffTime = maxBackoff
+				}
+			case <-b.done:
+				log.Println("Stopping bot reconnection due to shutdown signal")
+				return
+			}
+			continue
+		}
+
+		// If we get here, the update loop exited without error - reset backoff
+		log.Println("Update loop exited unexpectedly, restarting...")
+		backoffTime = 10 * time.Second
+	}
+}
+
+func (b *Bot) processUpdates() error {
 	u := tgbotapi.NewUpdate(0)
 	u.Timeout = 60
 
 	updates := b.bot.GetUpdatesChan(u)
+
+	// Create a channel to watch for the done signal
+	done := make(chan struct{})
+	go func() {
+		<-b.done
+		close(done)
+	}()
+
 	for update := range updates {
-		if update.Message == nil {
-			continue
+		// Check if we should stop
+		select {
+		case <-done:
+			return fmt.Errorf("bot is shutting down")
+		default:
+			// Continue processing
 		}
 
-		chatID := update.Message.Chat.ID
-		b.addSubscriber(chatID)
+		// Use recover to prevent panics from breaking the bot
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					log.Printf("Recovered from panic in update processing: %v", r)
+				}
+			}()
 
-		if update.Message.IsCommand() {
-			b.handleCommand(update.Message)
-		}
+			if update.Message == nil {
+				return
+			}
+
+			chatID := update.Message.Chat.ID
+			b.addSubscriber(chatID)
+
+			if update.Message.IsCommand() {
+				b.handleCommand(update.Message)
+			}
+		}()
 	}
+
+	// If we get here, the updates channel was closed
+	return fmt.Errorf("updates channel closed")
 }
 
 func (b *Bot) addSubscriber(chatID int64) {
@@ -175,32 +250,63 @@ func (b *Bot) handleAddCommand(chatID int64, repoURL string) {
 }
 
 func (b *Bot) checkReleases() {
+	// Add panic recovery
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("Recovered from panic in checkReleases: %v", r)
+			// Restart the goroutine
+			go b.checkReleases()
+		}
+	}()
+
 	ticker := time.NewTicker(b.checkInterval)
-	for range ticker.C {
-		rows, err := b.db.Query("SELECT url, latest_release FROM repositories")
-		if err != nil {
-			log.Printf("Error fetching repositories: %v", err)
-			continue
-		}
+	defer ticker.Stop()
 
-		for rows.Next() {
-			var url, latestRelease string
-			if err := rows.Scan(&url, &latestRelease); err != nil {
-				log.Printf("Error scanning row: %v", err)
-				continue
-			}
+	for {
+		select {
+		case <-ticker.C:
+			// Handle each check cycle in a recovery function
+			func() {
+				defer func() {
+					if r := recover(); r != nil {
+						log.Printf("Recovered from panic in release check cycle: %v", r)
+					}
+				}()
 
-			b.checkRepository(url, latestRelease)
+				rows, err := b.db.Query("SELECT url, latest_release FROM repositories")
+				if err != nil {
+					log.Printf("Error fetching repositories: %v", err)
+					return
+				}
+				defer rows.Close()
+
+				for rows.Next() {
+					var url, latestRelease string
+					if err := rows.Scan(&url, &latestRelease); err != nil {
+						log.Printf("Error scanning row: %v", err)
+						continue
+					}
+
+					b.checkRepository(url, latestRelease)
+				}
+			}()
+		case <-b.done:
+			log.Println("checkReleases routine received stop signal")
+			return
 		}
-		rows.Close()
 	}
 }
 
 func (b *Bot) checkRepository(repoURL, latestRelease string) {
+	// Add timeout for HTTP operations
+	client := &http.Client{
+		Timeout: 30 * time.Second,
+	}
+
 	apiURL := strings.Replace(repoURL, "https://github.com/", "https://api.github.com/repos/", 1)
 	apiURL = strings.Replace(apiURL, "/releases", "/releases/latest", 1)
 
-	resp, err := http.Get(apiURL)
+	resp, err := client.Get(apiURL)
 	if err != nil {
 		log.Printf("Error fetching release for %s: %v", repoURL, err)
 		return
@@ -208,17 +314,25 @@ func (b *Bot) checkRepository(repoURL, latestRelease string) {
 	defer resp.Body.Close()
 
 	if resp.StatusCode != 200 {
-		log.Printf("Non-200 status for %s: %d", repoURL, resp.StatusCode)
+		log.Printf("Non-200 status for %s: %d, will retry next cycle", repoURL, resp.StatusCode)
+		return
+	}
+
+	// Set explicit timeout for reading the response body
+	bodyBytes, err := io.ReadAll(resp.Body)
+	if err != nil {
+		log.Printf("Error reading response body for %s: %v", repoURL, err)
 		return
 	}
 
 	var release Release
-	if err := json.NewDecoder(resp.Body).Decode(&release); err != nil {
+	if err := json.Unmarshal(bodyBytes, &release); err != nil {
 		log.Printf("Error decoding release for %s: %v", repoURL, err)
 		return
 	}
 
 	if release.TagName != latestRelease {
+		log.Printf("Found new release for %s: %s (was: %s)", repoURL, release.TagName, latestRelease)
 		b.notifySubscribers(repoURL, &release)
 		_, err = b.db.Exec("UPDATE repositories SET latest_release = ? WHERE url = ?", release.TagName, repoURL)
 		if err != nil {
@@ -258,6 +372,37 @@ func (b *Bot) sendMessage(chatID int64, text string) {
 	}
 }
 
+// keepAlive sends periodic requests to Telegram to keep the connection alive
+func (b *Bot) keepAlive() {
+	ticker := time.NewTicker(5 * time.Minute)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			log.Println("Sending keepalive request to Telegram...")
+			_, err := b.bot.GetMe()
+			if err != nil {
+				log.Printf("Keepalive request failed: %v", err)
+			} else {
+				log.Println("Keepalive request successful")
+			}
+		case <-b.done:
+			log.Println("keepAlive routine received stop signal")
+			return
+		}
+	}
+}
+
+// Stop signals all goroutines to stop and closes the database
+func (b *Bot) Stop() {
+	close(b.done)
+	if b.db != nil {
+		b.db.Close()
+	}
+	log.Println("Bot stopped")
+}
+
 func main() {
 	// Load environment variables from .env file
 	if err := godotenv.Load(); err != nil {
@@ -274,6 +419,7 @@ func main() {
 	if err != nil {
 		log.Fatalf("Error creating bot: %v", err)
 	}
+	defer bot.Stop()
 
 	// Initialize with default repositories
 	defaultRepos := []string{
@@ -288,5 +434,17 @@ func main() {
 	}
 
 	log.Println("Bot started")
-	bot.Start()
+
+	// Setup signal handling for graceful shutdown
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
+
+	// Start the bot in a goroutine
+	go bot.Start()
+
+	// Wait for termination signal
+	sig := <-sigChan
+	log.Printf("Received signal %v, shutting down...", sig)
+
+	// bot.Stop() will be called by defer
 }
