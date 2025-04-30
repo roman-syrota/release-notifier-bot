@@ -1,4 +1,4 @@
-#!/usr/bin/bash
+#!/bin/bash
 echo "Compiling ..."
 go build -o bot cmd/bot/main.go
 echo "Starting ..."

@@ -31,3 +31,5 @@ Thumbs.db
 *.log 
 
 .env
+bot
+nohup.out

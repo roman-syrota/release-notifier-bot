@@ -1,8 +1,10 @@
 package main
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -10,6 +12,7 @@ import (
 	"os"
 	"os/signal"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -31,6 +34,7 @@ type Bot struct {
 	db            *sql.DB
 	checkInterval time.Duration
 	done          chan struct{}
+	commandQueue  chan tgbotapi.Update
 }
 
 func NewBot(token string, dbPath string, checkInterval time.Duration) (*Bot, error) {
@@ -38,6 +42,12 @@ func NewBot(token string, dbPath string, checkInterval time.Duration) (*Bot, err
 	if err != nil {
 		return nil, err
 	}
+
+	// Enable debugging to see all API requests and responses
+	bot.Debug = true
+
+	// Log bot information
+	log.Printf("Authorized on account %s (ID: %d)", bot.Self.UserName, bot.Self.ID)
 
 	dsn := fmt.Sprintf("%s?_journal_mode=WAL&_busy_timeout=5000", dbPath)
 	db, err := sql.Open("sqlite3", dsn)
@@ -66,6 +76,7 @@ func NewBot(token string, dbPath string, checkInterval time.Duration) (*Bot, err
 		db:            db,
 		checkInterval: checkInterval,
 		done:          make(chan struct{}),
+		commandQueue:  make(chan tgbotapi.Update, 100), // Buffer for 100 pending commands
 	}, nil
 }
 
@@ -75,16 +86,20 @@ func (b *Bot) Start() {
 	// Setup goroutines with appropriate error handling
 	go b.checkReleases()
 	go b.keepAlive()
+	go b.processCommands() // Start the command processor
 
 	// Configure exponential backoff for reconnection attempts
 	backoffTime := 10 * time.Second
 	maxBackoff := 5 * time.Minute
+	ticker := time.NewTicker(10 * time.Minute)
 
 	for {
 		select {
 		case <-b.done:
 			log.Println("Stopping bot due to shutdown signal")
 			return
+		case <-ticker.C:
+			log.Printf("Bot is running, command queue length: %d", len(b.commandQueue))
 		default:
 		}
 
@@ -117,7 +132,16 @@ func (b *Bot) processUpdates() error {
 	u := tgbotapi.NewUpdate(0)
 	u.Timeout = 60
 
+	// Remove any existing webhook to ensure we're using long polling
+	_, err := b.bot.Request(tgbotapi.DeleteWebhookConfig{DropPendingUpdates: true})
+	if err != nil {
+		log.Printf("Warning: failed to remove webhook: %v", err)
+	} else {
+		log.Println("Successfully removed webhook, using GetUpdatesChan")
+	}
+
 	updates := b.bot.GetUpdatesChan(u)
+	log.Println("Update channel established")
 
 	// Create a channel to watch for the done signal
 	done := make(chan struct{})
@@ -127,6 +151,8 @@ func (b *Bot) processUpdates() error {
 	}()
 
 	for update := range updates {
+		log.Printf("Received update: ID=%d, UpdateID=%d", update.UpdateID, update.UpdateID)
+
 		// Check if we should stop
 		select {
 		case <-done:
@@ -135,25 +161,34 @@ func (b *Bot) processUpdates() error {
 			// Continue processing
 		}
 
-		// Use recover to prevent panics from breaking the bot
-		func() {
-			defer func() {
-				if r := recover(); r != nil {
-					log.Printf("Recovered from panic in update processing: %v", r)
-				}
-			}()
-
-			if update.Message == nil {
-				return
-			}
-
-			chatID := update.Message.Chat.ID
-			b.addSubscriber(chatID)
+		// Just validate the Message isn't nil and log it
+		if update.Message != nil {
+			log.Printf("Enqueueing message: ID=%d, From=%s, Text: %s",
+				update.Message.MessageID,
+				update.Message.From.UserName,
+				update.Message.Text)
 
 			if update.Message.IsCommand() {
-				b.handleCommand(update.Message)
+				log.Printf("Received command: /%s from chat ID %d",
+					update.Message.Command(), update.Message.Chat.ID)
 			}
-		}()
+
+			// Queue the update for processing in a separate goroutine
+			select {
+			case b.commandQueue <- update:
+				log.Printf("Command from %s queued for processing", update.Message.From.UserName)
+			default:
+				// If queue is full, process immediately to prevent deadlock
+				log.Printf("Command queue full, processing command from %s immediately",
+					update.Message.From.UserName)
+				b.addSubscriber(update.Message.Chat.ID)
+				if update.Message.IsCommand() {
+					b.handleCommand(update.Message)
+				}
+			}
+		} else {
+			log.Println("Received update with nil Message, skipping")
+		}
 	}
 
 	// If we get here, the updates channel was closed
@@ -179,8 +214,10 @@ func (b *Bot) handleCommand(msg *tgbotapi.Message) {
 		b.handleLatestCommand(chatID, args)
 	case "add":
 		b.handleAddCommand(chatID, args)
+	case "ping", "start":
+		b.handlePingCommand(chatID)
 	default:
-		b.sendMessage(chatID, "Available commands:\n/list - Show monitored repositories\n/latest <repo_url> - Show latest release\n/add <repo_url> - Add repository to monitor")
+		b.sendMessage(chatID, "Available commands:\n/ping - Check if bot is alive\n/list - Show monitored repositories\n/latest <repo_url> - Show latest release\n/add <repo_url> - Add repository to monitor")
 	}
 }
 
@@ -249,6 +286,11 @@ func (b *Bot) handleAddCommand(chatID int64, repoURL string) {
 	b.sendMessage(chatID, fmt.Sprintf("Added repository: %s", repoURL))
 }
 
+func (b *Bot) handlePingCommand(chatID int64) {
+	log.Printf("Handling ping command from chat %d", chatID)
+	b.sendMessage(chatID, "I'm alive! Bot is working correctly.")
+}
+
 func (b *Bot) checkReleases() {
 	// Add panic recovery
 	defer func() {
@@ -273,12 +315,33 @@ func (b *Bot) checkReleases() {
 					}
 				}()
 
-				rows, err := b.db.Query("SELECT url, latest_release FROM repositories")
+				// Create a context with timeout for the entire check cycle
+				ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+				defer cancel()
+
+				// Create a context for database operations
+				dbCtx, dbCancel := context.WithTimeout(ctx, 10*time.Second)
+				defer dbCancel()
+
+				log.Println("Starting release check cycle")
+				startTime := time.Now()
+
+				rows, err := b.db.QueryContext(dbCtx, "SELECT url, latest_release FROM repositories")
 				if err != nil {
+					if errors.Is(err, context.DeadlineExceeded) {
+						log.Printf("Database query timed out in checkReleases")
+						return
+					}
 					log.Printf("Error fetching repositories: %v", err)
 					return
 				}
 				defer rows.Close()
+
+				// Process each repository with a safety limit to prevent too many concurrent checks
+				var repoList []struct {
+					URL           string
+					LatestRelease string
+				}
 
 				for rows.Next() {
 					var url, latestRelease string
@@ -286,8 +349,75 @@ func (b *Bot) checkReleases() {
 						log.Printf("Error scanning row: %v", err)
 						continue
 					}
+					repoList = append(repoList, struct {
+						URL           string
+						LatestRelease string
+					}{URL: url, LatestRelease: latestRelease})
+				}
 
-					b.checkRepository(url, latestRelease)
+				if len(repoList) == 0 {
+					log.Println("No repositories to check")
+					return
+				}
+
+				log.Printf("Found %d repositories to check", len(repoList))
+
+				// Use a wait group to track completion of all checks
+				var wg sync.WaitGroup
+				// Limit concurrent checks to avoid overwhelming GitHub API
+				semaphore := make(chan struct{}, 2) // Allow 2 concurrent checks
+
+				for _, repo := range repoList {
+					// Check for context cancellation
+					select {
+					case <-ctx.Done():
+						log.Printf("Check cycle timed out after %v", time.Since(startTime))
+						return
+					default:
+						// Continue processing
+					}
+
+					wg.Add(1)
+					semaphore <- struct{}{} // Acquire semaphore
+					go func(url, latestRelease string) {
+						defer wg.Done()
+						defer func() { <-semaphore }() // Release semaphore
+
+						// Create a separate context for each repository check
+						checkCtx, checkCancel := context.WithTimeout(ctx, 45*time.Second)
+						defer checkCancel()
+
+						// Create a done channel to track completion
+						done := make(chan struct{})
+
+						go func() {
+							b.checkRepository(url, latestRelease)
+							close(done)
+						}()
+
+						// Wait for either completion or timeout
+						select {
+						case <-done:
+							// Check completed normally
+						case <-checkCtx.Done():
+							log.Printf("Repository check for %s timed out", url)
+						}
+					}(repo.URL, repo.LatestRelease)
+				}
+
+				// Wait for all checks to complete or timeout
+				waitCh := make(chan struct{})
+				go func() {
+					wg.Wait()
+					close(waitCh)
+				}()
+
+				// Wait with timeout for all checks to complete
+				select {
+				case <-waitCh:
+					log.Printf("All repository checks completed in %v", time.Since(startTime))
+				case <-ctx.Done():
+					log.Printf("Some repository checks did not complete before timeout after %v", time.Since(startTime))
 				}
 			}()
 		case <-b.done:
@@ -298,30 +428,65 @@ func (b *Bot) checkReleases() {
 }
 
 func (b *Bot) checkRepository(repoURL, latestRelease string) {
+	// Create a context with timeout for the entire operation
+	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+	defer cancel()
+
 	// Add timeout for HTTP operations
 	client := &http.Client{
 		Timeout: 30 * time.Second,
+		Transport: &http.Transport{
+			IdleConnTimeout:       90 * time.Second,
+			ResponseHeaderTimeout: 10 * time.Second,
+			TLSHandshakeTimeout:   10 * time.Second,
+		},
 	}
 
 	apiURL := strings.Replace(repoURL, "https://github.com/", "https://api.github.com/repos/", 1)
 	apiURL = strings.Replace(apiURL, "/releases", "/releases/latest", 1)
 
-	resp, err := client.Get(apiURL)
+	// Create a request with the context
+	req, err := http.NewRequestWithContext(ctx, "GET", apiURL, nil)
 	if err != nil {
-		log.Printf("Error fetching release for %s: %v", repoURL, err)
+		log.Printf("Error creating request for %s: %v", repoURL, err)
+		return
+	}
+
+	// Add user agent to avoid GitHub API limitations
+	req.Header.Set("User-Agent", "TelegramReleaseBot/1.0")
+
+	// Send the request with context
+	resp, err := client.Do(req)
+	if err != nil {
+		if errors.Is(err, context.DeadlineExceeded) {
+			log.Printf("Timeout fetching release for %s", repoURL)
+		} else {
+			log.Printf("Error fetching release for %s: %v", repoURL, err)
+		}
 		return
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != 200 {
-		log.Printf("Non-200 status for %s: %d, will retry next cycle", repoURL, resp.StatusCode)
+		// Handle specific error codes better
+		if resp.StatusCode == 403 {
+			log.Printf("Rate limit exceeded for %s (403), will retry next cycle", repoURL)
+		} else if resp.StatusCode == 404 {
+			log.Printf("Repository or release not found for %s (404)", repoURL)
+		} else {
+			log.Printf("Non-200 status for %s: %d, will retry next cycle", repoURL, resp.StatusCode)
+		}
 		return
 	}
 
-	// Set explicit timeout for reading the response body
-	bodyBytes, err := io.ReadAll(resp.Body)
+	// Use limited reader to prevent extremely large responses
+	bodyBytes, err := io.ReadAll(io.LimitReader(resp.Body, 1024*1024)) // Limit to 1MB
 	if err != nil {
-		log.Printf("Error reading response body for %s: %v", repoURL, err)
+		if errors.Is(err, context.DeadlineExceeded) {
+			log.Printf("Timeout reading response body for %s", repoURL)
+		} else {
+			log.Printf("Error reading response body for %s: %v", repoURL, err)
+		}
 		return
 	}
 
@@ -331,12 +496,36 @@ func (b *Bot) checkRepository(repoURL, latestRelease string) {
 		return
 	}
 
+	// Check for context timeout
+	select {
+	case <-ctx.Done():
+		log.Printf("Operation timed out for %s: %v", repoURL, ctx.Err())
+		return
+	default:
+		// Continue processing
+	}
+
 	if release.TagName != latestRelease {
 		log.Printf("Found new release for %s: %s (was: %s)", repoURL, release.TagName, latestRelease)
-		b.notifySubscribers(repoURL, &release)
-		_, err = b.db.Exec("UPDATE repositories SET latest_release = ? WHERE url = ?", release.TagName, repoURL)
+
+		// Create a separate goroutine for notifications to avoid blocking
+		go func(r Release) {
+			log.Printf("Starting notification for %s in background", repoURL)
+			b.notifySubscribers(repoURL, &r)
+		}(release)
+
+		// Add context timeout for database operations
+		dbCtx, dbCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer dbCancel()
+
+		// Use context in database operation
+		_, err = b.db.ExecContext(dbCtx, "UPDATE repositories SET latest_release = ? WHERE url = ?", release.TagName, repoURL)
 		if err != nil {
-			log.Printf("Error updating latest release: %v", err)
+			if errors.Is(err, context.DeadlineExceeded) {
+				log.Printf("Database update timed out for %s", repoURL)
+			} else {
+				log.Printf("Error updating latest release: %v", err)
+			}
 		} else {
 			log.Printf("New release: %s, %s", release.TagName, repoURL)
 		}
@@ -344,8 +533,21 @@ func (b *Bot) checkRepository(repoURL, latestRelease string) {
 }
 
 func (b *Bot) notifySubscribers(repoURL string, release *Release) {
-	rows, err := b.db.Query("SELECT chat_id FROM subscribers")
+	// Create context with timeout for the entire operation
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	// Create context for database operation
+	dbCtx, dbCancel := context.WithTimeout(ctx, 10*time.Second)
+	defer dbCancel()
+
+	// Use context in database query
+	rows, err := b.db.QueryContext(dbCtx, "SELECT chat_id FROM subscribers")
 	if err != nil {
+		if errors.Is(err, context.DeadlineExceeded) {
+			log.Printf("Database query timed out in notifySubscribers")
+			return
+		}
 		log.Printf("Error fetching subscribers: %v", err)
 		return
 	}
@@ -354,22 +556,99 @@ func (b *Bot) notifySubscribers(repoURL string, release *Release) {
 	message := fmt.Sprintf("New release for %s\nVersion: %s\nName: %s\nPublished: %s\nDetails: %s",
 		repoURL, release.TagName, release.Name, release.PublishedAt.Format(time.RFC822), release.HTMLURL)
 
+	// Create a wait group to track notification completion
+	var wg sync.WaitGroup
+	// Limit concurrent notifications to avoid overwhelming Telegram API
+	semaphore := make(chan struct{}, 3) // Allow 3 concurrent notifications
+
 	for rows.Next() {
+		// Check for context cancellation
+		select {
+		case <-ctx.Done():
+			log.Printf("Notification operation timed out for %s", repoURL)
+			return
+		default:
+			// Continue processing
+		}
+
 		var chatID int64
 		if err := rows.Scan(&chatID); err != nil {
 			log.Printf("Error scanning subscriber: %v", err)
 			continue
 		}
-		b.sendMessage(chatID, message)
+
+		// Use a goroutine for each notification but limit concurrency
+		wg.Add(1)
+		semaphore <- struct{}{} // Acquire semaphore
+		go func(id int64) {
+			defer wg.Done()
+			defer func() { <-semaphore }() // Release semaphore
+
+			// Create a timeout specifically for this notification
+			msgCtx, msgCancel := context.WithTimeout(ctx, 15*time.Second)
+			defer msgCancel()
+
+			// Create a done channel to track completion
+			done := make(chan struct{})
+
+			go func() {
+				b.sendMessage(id, message)
+				close(done)
+			}()
+
+			// Wait for either completion or timeout
+			select {
+			case <-done:
+				// Message sent successfully or failed with retry
+			case <-msgCtx.Done():
+				log.Printf("Notification to %d timed out", id)
+			}
+		}(chatID)
+	}
+
+	// Wait for all notifications to complete or timeout
+	waitCh := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(waitCh)
+	}()
+
+	// Wait with timeout for all notifications to complete
+	select {
+	case <-waitCh:
+		log.Printf("All notifications sent for %s", repoURL)
+	case <-ctx.Done():
+		log.Printf("Some notifications for %s may not have completed before timeout", repoURL)
 	}
 }
 
 func (b *Bot) sendMessage(chatID int64, text string) {
+	log.Printf("Sending message to chat %d: %s", chatID, text)
 	msg := tgbotapi.NewMessage(chatID, text)
-	_, err := b.bot.Send(msg)
-	if err != nil {
-		log.Printf("Error sending message to %d: %v", chatID, err)
+
+	// We'll use the original bot but with retry logic
+
+	// Add retry logic for send failures
+	var sendErr error
+	maxRetries := 3
+	for i := 0; i < maxRetries; i++ {
+		_, sendErr = b.bot.Send(msg)
+		if sendErr == nil {
+			log.Printf("Message successfully sent to %d", chatID)
+			return
+		}
+		log.Printf("Error sending message to %d (attempt %d/%d): %v",
+			chatID, i+1, maxRetries, sendErr)
+
+		// Wait before retrying
+		if i < maxRetries-1 {
+			time.Sleep(time.Duration(2*(i+1)) * time.Second) // Increase backoff with each retry
+		}
 	}
+
+	// If we get here, all retries failed
+	log.Printf("Failed to send message to %d after %d attempts: %v",
+		chatID, maxRetries, sendErr)
 }
 
 // keepAlive sends periodic requests to Telegram to keep the connection alive
@@ -401,6 +680,63 @@ func (b *Bot) Stop() {
 		b.db.Close()
 	}
 	log.Println("Bot stopped")
+}
+
+// processCommands handles commands from the command queue in a separate goroutine
+func (b *Bot) processCommands() {
+	log.Println("Command processor started")
+	//ticker := time.NewTicker(10 * time.Second)
+	//defer ticker.Stop()
+	for {
+		//log.Printf("Command queue length: %d", len(b.commandQueue))
+		select {
+		//case <-ticker.C:
+		//	log.Printf("Bot is running, command queue length: %d", len(b.commandQueue))
+		case update := <-b.commandQueue:
+			// Process the command with full error recovery
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			done := make(chan struct{})
+			func() {
+				defer func() {
+					if r := recover(); r != nil {
+						log.Printf("PANIC in command processing: %v", r)
+					}
+				}()
+
+				if update.Message == nil {
+					return
+				}
+
+				chatID := update.Message.Chat.ID
+
+				// Add subscriber regardless of command
+				b.addSubscriber(chatID)
+
+				if update.Message.IsCommand() {
+					command := update.Message.Command()
+					log.Printf("Processing command: /%s from chat ID %d", command, chatID)
+
+					// Process the command with timing information
+					start := time.Now()
+					b.handleCommand(update.Message)
+					elapsed := time.Since(start)
+
+					log.Printf("Command /%s processed in %v", command, elapsed)
+				}
+
+				select {
+				case <-done:
+				case <-ctx.Done():
+					log.Printf("Command processing timed out for update: %+v", update)
+				}
+			}()
+
+		case <-b.done:
+			log.Println("Command processor shutting down")
+			return
+		}
+	}
 }
 
 func main() {
