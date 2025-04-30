@@ -221,6 +221,8 @@ func (b *Bot) checkRepository(repoURL, latestRelease string) {
 		_, err = b.db.Exec("UPDATE repositories SET latest_release = ? WHERE url = ?", release.TagName, repoURL)
 		if err != nil {
 			log.Printf("Error updating latest release: %v", err)
+		} else {
+			log.Printf("New release: %s, %s", release.TagName, repoURL)
 		}
 	}
 }
