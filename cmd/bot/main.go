@@ -6,10 +6,12 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"os"
 	"strings"
 	"time"
 
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
+	"github.com/joho/godotenv"
 	_ "github.com/mattn/go-sqlite3"
 )
 
@@ -257,7 +259,14 @@ func (b *Bot) sendMessage(chatID int64, text string) {
 }
 
 func main() {
-	token := "YOUR_TELEGRAM_BOT_TOKEN" // Replace with your bot token
+	// Load environment variables from .env file
+	if err := godotenv.Load(); err != nil {
+		log.Println("No .env file found, proceeding with environment variables")
+	}
+	token := os.Getenv("TELEGRAM_BOT_TOKEN")
+	if token == "" {
+		log.Fatal("TELEGRAM_BOT_TOKEN environment variable not set")
+	}
 	dbPath := "bot.db"
 	checkInterval := 5 * time.Minute
 
