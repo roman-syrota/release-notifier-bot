@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"encoding/json"
@@ -30,11 +31,12 @@ type Release struct {
 }
 
 type Bot struct {
-	bot           *tgbotapi.BotAPI
-	db            *sql.DB
-	checkInterval time.Duration
-	done          chan struct{}
-	commandQueue  chan tgbotapi.Update
+	bot               *tgbotapi.BotAPI
+	db                *sql.DB
+	checkInterval     time.Duration
+	done              chan struct{}
+	commandQueue      chan tgbotapi.Update
+	discordWebhookURL string // Add Discord webhook URL
 }
 
 func NewBot(token string, dbPath string, checkInterval time.Duration) (*Bot, error) {
@@ -66,17 +68,22 @@ func NewBot(token string, dbPath string, checkInterval time.Duration) (*Bot, err
 		CREATE TABLE IF NOT EXISTS subscribers (
 			chat_id INTEGER PRIMARY KEY
 		);
+		CREATE TABLE IF NOT EXISTS discord_webhooks (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			url TEXT NOT NULL UNIQUE
+		);
 	`)
 	if err != nil {
 		return nil, err
 	}
 
 	return &Bot{
-		bot:           bot,
-		db:            db,
-		checkInterval: checkInterval,
-		done:          make(chan struct{}),
-		commandQueue:  make(chan tgbotapi.Update, 100), // Buffer for 100 pending commands
+		bot:               bot,
+		db:                db,
+		checkInterval:     checkInterval,
+		done:              make(chan struct{}),
+		commandQueue:      make(chan tgbotapi.Update, 100), // Buffer for 100 pending commands
+		discordWebhookURL: "",                              // Empty by default
 	}, nil
 }
 
@@ -216,8 +223,10 @@ func (b *Bot) handleCommand(msg *tgbotapi.Message) {
 		b.handleAddCommand(chatID, args)
 	case "ping", "start":
 		b.handlePingCommand(chatID)
+	case "discord":
+		b.handleDiscordCommand(chatID, args)
 	default:
-		b.sendMessage(chatID, "Available commands:\n/ping - Check if bot is alive\n/list - Show monitored repositories\n/latest <repo_url> - Show latest release\n/add <repo_url> - Add repository to monitor")
+		b.sendMessage(chatID, "Available commands:\n/ping - Check if bot is alive\n/list - Show monitored repositories\n/latest <repo_url> - Show latest release\n/add <repo_url> - Add repository to monitor\n/discord <webhook_url> - Set Discord webhook URL for notifications")
 	}
 }
 
@@ -289,6 +298,30 @@ func (b *Bot) handleAddCommand(chatID int64, repoURL string) {
 func (b *Bot) handlePingCommand(chatID int64) {
 	log.Printf("Handling ping command from chat %d", chatID)
 	b.sendMessage(chatID, "I'm alive! Bot is working correctly.")
+}
+
+func (b *Bot) handleDiscordCommand(chatID int64, webhookURL string) {
+	if webhookURL == "" {
+		b.sendMessage(chatID, "Please provide a Discord webhook URL")
+		return
+	}
+
+	if !strings.HasPrefix(webhookURL, "https://discord.com/api/webhooks/") {
+		b.sendMessage(chatID, "Invalid Discord webhook URL. It should start with https://discord.com/api/webhooks/")
+		return
+	}
+
+	// Save the webhook URL to the database
+	_, err := b.db.Exec("INSERT OR REPLACE INTO discord_webhooks (url) VALUES (?)", webhookURL)
+	if err != nil {
+		log.Printf("Error saving Discord webhook URL: %v", err)
+		b.sendMessage(chatID, "Error saving Discord webhook URL")
+		return
+	}
+
+	// Update the bot's Discord webhook URL
+	b.discordWebhookURL = webhookURL
+	b.sendMessage(chatID, "Discord webhook URL has been set successfully. You will now receive notifications on Discord.")
 }
 
 func (b *Bot) checkReleases() {
@@ -606,6 +639,27 @@ func (b *Bot) notifySubscribers(repoURL string, release *Release) {
 		}(chatID)
 	}
 
+	// Also notify Discord if webhook URL is set
+	if b.discordWebhookURL != "" {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			b.notifyDiscord(repoURL, release)
+		}()
+	} else {
+		// Try to load webhook URL from database if not set
+		var webhookURL string
+		err := b.db.QueryRowContext(dbCtx, "SELECT url FROM discord_webhooks LIMIT 1").Scan(&webhookURL)
+		if err == nil && webhookURL != "" {
+			b.discordWebhookURL = webhookURL
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				b.notifyDiscord(repoURL, release)
+			}()
+		}
+	}
+
 	// Wait for all notifications to complete or timeout
 	waitCh := make(chan struct{})
 	go func() {
@@ -620,6 +674,82 @@ func (b *Bot) notifySubscribers(repoURL string, release *Release) {
 	case <-ctx.Done():
 		log.Printf("Some notifications for %s may not have completed before timeout", repoURL)
 	}
+}
+
+// Function to send notification to Discord webhook
+func (b *Bot) notifyDiscord(repoURL string, release *Release) {
+	if b.discordWebhookURL == "" {
+		log.Printf("Discord webhook URL not set, skipping Discord notification")
+		return
+	}
+
+	// Create Discord message payload
+	type DiscordEmbed struct {
+		Title       string `json:"title"`
+		Description string `json:"description"`
+		URL         string `json:"url"`
+		Color       int    `json:"color"`
+		Timestamp   string `json:"timestamp"`
+	}
+
+	type DiscordWebhookPayload struct {
+		Username string         `json:"username"`
+		Content  string         `json:"content"`
+		Embeds   []DiscordEmbed `json:"embeds"`
+	}
+
+	// Format the message for Discord with rich embed
+	discordEmbed := DiscordEmbed{
+		Title: fmt.Sprintf("New Release: %s %s", repoURL, release.TagName),
+		Description: fmt.Sprintf("**Name:** %s\n**Published:** %s\n**Details:** %s",
+			release.Name,
+			release.PublishedAt.Format(time.RFC822),
+			release.HTMLURL),
+		URL:       release.HTMLURL,
+		Color:     3447003, // Blue color
+		Timestamp: time.Now().Format(time.RFC3339),
+	}
+
+	payload := DiscordWebhookPayload{
+		Username: "GitHub Release Monitor",
+		Content:  fmt.Sprintf("New release detected for %s!", repoURL),
+		Embeds:   []DiscordEmbed{discordEmbed},
+	}
+
+	// Convert payload to JSON
+	jsonPayload, err := json.Marshal(payload)
+	if err != nil {
+		log.Printf("Error marshaling Discord payload: %v", err)
+		return
+	}
+
+	// Send the webhook request
+	maxRetries := 3
+	for i := 0; i < maxRetries; i++ {
+		resp, err := http.Post(b.discordWebhookURL, "application/json", bytes.NewBuffer(jsonPayload))
+		if err != nil {
+			log.Printf("Error sending Discord webhook (attempt %d/%d): %v", i+1, maxRetries, err)
+			if i < maxRetries-1 {
+				time.Sleep(time.Duration(2*(i+1)) * time.Second) // Increase backoff with each retry
+			}
+			continue
+		}
+		defer resp.Body.Close()
+
+		if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+			log.Printf("Discord webhook sent successfully")
+			return
+		} else {
+			body, _ := io.ReadAll(resp.Body)
+			log.Printf("Discord webhook error (attempt %d/%d): status %d, response: %s",
+				i+1, maxRetries, resp.StatusCode, string(body))
+			if i < maxRetries-1 {
+				time.Sleep(time.Duration(2*(i+1)) * time.Second) // Increase backoff with each retry
+			}
+		}
+	}
+
+	log.Printf("Failed to send Discord webhook after %d attempts", maxRetries)
 }
 
 func (b *Bot) sendMessage(chatID int64, text string) {
@@ -767,6 +897,16 @@ func main() {
 		if err != nil {
 			log.Printf("Error adding default repository %s: %v", repo, err)
 		}
+	}
+
+	// Load Discord webhook URL from database if exists
+	var discordWebhookURL string
+	err = bot.db.QueryRow("SELECT url FROM discord_webhooks LIMIT 1").Scan(&discordWebhookURL)
+	if err == nil {
+		bot.discordWebhookURL = discordWebhookURL
+		log.Printf("Loaded Discord webhook URL from database")
+	} else if err != sql.ErrNoRows {
+		log.Printf("Error loading Discord webhook URL: %v", err)
 	}
 
 	log.Println("Bot started")
